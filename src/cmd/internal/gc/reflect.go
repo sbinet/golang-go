@@ -1226,7 +1226,7 @@ ok:
 				break
 			}
 			fallthrough
-		case TARRAY, TCHAN, TFUNC, TMAP:
+		case TARRAY, TCHAN, TFUNC, TMAP, TSTRUCT:
 			slink := typelinksym(t)
 			dsymptr(slink, 0, s, 0)
 			ggloblsym(slink, int32(Widthptr), int8(dupok|obj.RODATA))

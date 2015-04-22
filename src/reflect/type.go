@@ -1355,7 +1355,7 @@ func typesByString(s string) []*rtype {
 	return ret
 }
 
-// The lookupCache caches ChanOf, MapOf, and SliceOf lookups.
+// The lookupCache caches ArrayOf, ChanOf, MapOf, StructOf and SliceOf lookups.
 var lookupCache struct {
 	sync.RWMutex
 	m map[cacheKey]*rtype
@@ -1871,6 +1871,269 @@ func SliceOf(t Type) Type {
 	slice.zero = unsafe.Pointer(&make([]byte, slice.size)[0])
 
 	return cachePut(ckey, &slice.rtype)
+}
+
+// StructOf returns the struct type containing fields. Field offsets are ignored
+// and computed as they would be by the compiler.
+func StructOf(fields []StructField) Type {
+	var (
+		hash       = fnv1(0, []byte("empty")...)
+		size       uintptr
+		typalign   uint8
+		comparable = true
+		hashable   = true
+		uncommon   *uncommonType
+		imeths     = []int{} // indices of methods from embedded interfaces
+
+		fs   = make([]structField, len(fields))
+		repr = make([]byte, 0, 64)
+		fset = map[string]struct{}{} // fields' names
+	)
+
+	repr = append(repr, "struct {"...)
+	for i, field := range fields {
+		f := runtimeStructField(field)
+		ft := f.typ
+
+		name := ""
+		// Update string and hash
+		if f.name != nil {
+			hash = fnv1(hash, []byte(*f.name)...)
+			repr = append(repr, (" " + *f.name)...)
+			name = *f.name
+		} else {
+			// Embedded field
+			if f.typ.Kind() == Ptr {
+				// Embedded ** and *interface{} are illegal
+				elem := ft.Elem()
+				if k := elem.Kind(); k == Ptr || k == Interface {
+					panic("reflect.StructOf: illegal anonymous field type " + *ft.string)
+				}
+				name = elem.String()
+			} else {
+				name = *ft.string
+			}
+			// TODO(sbinet) check for syntacticaly impossible type names?
+
+			// if this embedded field has methods, we need to collect them
+			if ft.NumMethod() > 0 && uncommon == nil {
+				uncommon = new(uncommonType)
+			}
+			switch f.typ.Kind() {
+			case Interface:
+				ift := (*interfaceType)(unsafe.Pointer(ft))
+				for _, im := range ift.methods {
+					imeths = append(imeths, len(uncommon.methods))
+					var (
+						mname    *string
+						mpkgPath *string
+					)
+					if im.name != nil {
+						mname = strPtrOrNil(*im.name)
+					}
+					if im.pkgPath != nil {
+						mpkgPath = strPtrOrNil(*im.pkgPath)
+					}
+					uncommon.methods = append(
+						uncommon.methods,
+						method{
+							name:    mname,
+							pkgPath: mpkgPath,
+							mtyp:    im.typ,
+							ifn:     nil, // FIXME(sbinet)
+							tfn:     nil, // FIXME(sbinet)
+						},
+					)
+				}
+			case Ptr:
+				ptr := (*ptrType)(unsafe.Pointer(ft))
+				if unt := ptr.uncommon(); unt != nil && len(unt.methods) > 0 {
+					uncommon.methods = append(
+						uncommon.methods,
+						unt.methods...,
+					)
+				}
+				if unt := ptr.elem.uncommon(); unt != nil && len(unt.methods) > 0 {
+					uncommon.methods = append(
+						uncommon.methods,
+						unt.methods...,
+					)
+				}
+			default:
+				if unt := ft.uncommon(); unt != nil && len(unt.methods) > 0 {
+					uncommon.methods = append(
+						uncommon.methods,
+						unt.methods...,
+					)
+				}
+			}
+		}
+		if _, dup := fset[name]; dup {
+			panic("reflect.StructOf: duplicate field " + name)
+		}
+		fset[name] = struct{}{}
+
+		hash = fnv1(hash, byte(ft.hash>>24), byte(ft.hash>>16), byte(ft.hash>>8), byte(ft.hash))
+
+		repr = append(repr, (" " + *ft.string)...)
+		if f.tag != nil {
+			hash = fnv1(hash, []byte(*f.tag)...)
+			repr = append(repr, (" " + strconv.Quote(*f.tag))...)
+		}
+		if i < len(fields)-1 {
+			repr = append(repr, ';')
+		}
+
+		comparable = comparable && (ft.alg.equal != nil)
+		hashable = hashable && (ft.alg.hash != nil)
+
+		f.offset = align(size, uintptr(ft.align))
+		if ft.align > typalign {
+			typalign = ft.align
+		}
+		size = f.offset + ft.size
+
+		fs[i] = f
+	}
+	if len(fs) > 0 {
+		repr = append(repr, ' ')
+	}
+	repr = append(repr, '}')
+	str := string(repr)
+
+	// Round the size up to be a multiple of the alignment.
+	size = align(size, uintptr(typalign))
+
+	// Make the struct type.
+	var istruct interface{} = struct{}{}
+	prototype := *(**structType)(unsafe.Pointer(&istruct))
+	typ := new(structType)
+	*typ = *prototype
+	typ.fields = fs
+
+	// Create a key.
+	// There is a chance of a hash collision.
+	ckey := cacheKey{Struct, nil, nil, uintptr(hash)}
+	if len(fs) >= 1 {
+		ckey.t1 = fs[0].typ
+	}
+	if len(fs) >= 2 {
+		ckey.t2 = fs[1].typ
+	}
+
+	if t := cacheGet(ckey); t != nil {
+		if haveIdenticalUnderlyingType(t.common(), &typ.rtype) {
+			return t
+		}
+	}
+
+	// Look in known types.
+	for _, t := range typesByString(str) {
+		if haveIdenticalUnderlyingType(t.common(), &typ.rtype) {
+			return cachePut(ckey, t)
+		}
+	}
+
+	typ.string = &str
+	typ.hash = hash
+	typ.size = size
+	typ.align = typalign
+	typ.fieldAlign = typalign
+	typ.uncommonType = uncommon
+	if len(imeths) > 0 {
+		for _, i := range imeths {
+			m := &typ.uncommonType.methods[i]
+			mt := (*funcType)(unsafe.Pointer(m.mtyp))
+			in := make([]Type, 0, len(mt.in)+1)
+			in = append(in, typ.common())
+			for _, t := range mt.in {
+				in = append(in, t)
+			}
+			out := make([]Type, 0, len(mt.out))
+			for _, t := range mt.out {
+				out = append(out, t)
+			}
+			ft := FuncOf(in, out, mt.dotdotdot)
+			m.typ = ft.common()
+			// m.ifn ??? // FIXME(sbinet)
+			// m.tfn ??? // FIXME(sbinet)
+		}
+	}
+	if typ.size > 0 {
+		typ.zero = unsafe.Pointer(&make([]byte, typ.size)[0])
+	}
+
+	// ptrToThis must be nil for a new pointer type to be synthesized.
+	typ.ptrToThis = nil
+	typ.ptrToThis = typ.rtype.ptrTo()
+
+	var gc gcProg
+	for _, ft := range fs {
+		// FIXME(sbinet) handle padding, fields smaller than a word
+		gc.appendProg(ft.typ)
+	}
+
+	var hasPtr bool
+	typ.gc[0], hasPtr = gc.finalize()
+	if !hasPtr {
+		typ.kind |= kindNoPointers
+	} else {
+		typ.kind &^= kindNoPointers
+	}
+
+	typ.alg = new(typeAlg)
+	if hashable {
+		typ.alg.hash = func(p unsafe.Pointer, seed uintptr) uintptr {
+			o := seed
+			for _, ft := range typ.fields {
+				pi := unsafe.Pointer(uintptr(p) + ft.offset)
+				o = ft.typ.alg.hash(pi, o)
+			}
+			return o
+		}
+	}
+
+	if comparable {
+		typ.alg.equal = func(p, q unsafe.Pointer) bool {
+			for _, ft := range typ.fields {
+				pi := unsafe.Pointer(uintptr(p) + ft.offset)
+				qi := unsafe.Pointer(uintptr(q) + ft.offset)
+				if !ft.typ.alg.equal(pi, qi) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	switch {
+	case len(fs) == 1 && !ifaceIndir(fs[0].typ):
+		// structs of 1 direct iface type can be direct
+		typ.kind |= kindDirectIface
+	default:
+		typ.kind &^= kindDirectIface
+	}
+
+	return cachePut(ckey, &typ.rtype)
+}
+
+func runtimeStructField(field StructField) structField {
+	return structField{
+		name:    strPtrOrNil(field.Name),
+		pkgPath: strPtrOrNil(field.PkgPath),
+		typ:     field.Type.common(),
+		tag:     strPtrOrNil(string(field.Tag)),
+		offset:  0,
+	}
+}
+
+func strPtrOrNil(str string) *string {
+	if str == "" {
+		return nil
+	}
+	ret := new(string)
+	*ret = str
+	return ret
 }
 
 // ArrayOf returns the array type with the given count and element type.

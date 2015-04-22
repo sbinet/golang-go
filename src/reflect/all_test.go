@@ -3693,6 +3693,401 @@ func TestSliceOfGC(t *testing.T) {
 	}
 }
 
+func TestStructOf(t *testing.T) {
+	// check construction and use of type not in binary
+	fields := []StructField{
+		StructField{
+			Name: "S",
+			Tag:  "s",
+			Type: TypeOf(""),
+		},
+		StructField{
+			Name: "X",
+			Tag:  "x",
+			Type: TypeOf(byte(0)),
+		},
+		StructField{
+			Name: "Y",
+			Type: TypeOf(uint64(0)),
+		},
+		StructField{
+			Name: "Z",
+			Type: TypeOf([3]uint16{}),
+		},
+	}
+
+	st := StructOf(fields)
+	v := New(st).Elem()
+	runtime.GC()
+	v.FieldByName("X").Set(ValueOf(byte(2)))
+	v.FieldByIndex([]int{1}).Set(ValueOf(byte(1)))
+	runtime.GC()
+
+	s := fmt.Sprint(v.Interface())
+	want := `{ 1 0 [0 0 0]}`
+	if s != want {
+		t.Errorf("constructed struct = %s, want %s", s, want)
+	}
+
+	// check the size, alignment and field offsets
+	stt := TypeOf(struct {
+		String string
+		X      byte
+		Y      uint64
+		Z      [3]uint16
+	}{})
+	if st.Size() != stt.Size() {
+		t.Errorf("constructed struct size = %v, want %v", st.Size(), stt.Size())
+	}
+	if st.Align() != stt.Align() {
+		t.Errorf("constructed struct align = %v, want %v", st.Align(), stt.Align())
+	}
+	if st.FieldAlign() != stt.FieldAlign() {
+		t.Errorf("constructed struct field align = %v, want %v", st.FieldAlign(), stt.FieldAlign())
+	}
+	for i := 0; i < st.NumField(); i++ {
+		o1 := st.Field(i).Offset
+		o2 := stt.Field(i).Offset
+		if o1 != o2 {
+			t.Errorf("constructed struct field %v offset = %v, want %v", i, o1, o2)
+		}
+	}
+
+	// check duplicate names
+	shouldPanic(func() {
+		StructOf([]StructField{
+			StructField{Name: "string", Type: TypeOf("")},
+			StructField{Name: "string", Type: TypeOf("")},
+		})
+	})
+	shouldPanic(func() {
+		StructOf([]StructField{
+			StructField{Type: TypeOf("")},
+			StructField{Name: "string", Type: TypeOf("")},
+		})
+	})
+	shouldPanic(func() {
+		StructOf([]StructField{
+			StructField{Type: TypeOf("")},
+			StructField{Type: TypeOf("")},
+		})
+	})
+	// check that type already in binary is found
+	checkSameType(t, Zero(StructOf(fields[2:3])).Interface(), struct{ Y uint64 }{})
+}
+
+func TestStructOfGC(t *testing.T) {
+	type T *uintptr
+	tt := TypeOf(T(nil))
+	fields := []StructField{
+		{Name: "X", Type: TypeOf(T(nil))},
+		{Name: "Y", Type: TypeOf(T(nil))},
+	}
+	st := StructOf(fields)
+
+	const n = 10000
+	var x []interface{}
+	for i := 0; i < n; i++ {
+		v := New(st).Elem()
+		for j := 0; j < v.NumField(); j += 1 {
+			p := new(uintptr)
+			*p = uintptr(i*n + j)
+			v.Field(j).Set(ValueOf(p).Convert(tt))
+		}
+		x = append(x, v.Interface())
+	}
+	runtime.GC()
+
+	for i, xi := range x {
+		v := ValueOf(xi)
+		for j := 0; j < v.NumField(); j += 1 {
+			k := v.Field(j).Elem().Interface()
+			if k != uintptr(i*n+j) {
+				t.Errorf("lost x[%d]%c = %d, want %d", i, "XY"[j], k, i*n+j)
+			}
+		}
+	}
+}
+
+func TestStructOfAlg(t *testing.T) {
+	st := StructOf([]StructField{{Name: "X", Tag: "x", Type: TypeOf(int(0))}})
+	v1 := New(st).Elem()
+	v2 := New(st).Elem()
+	if !DeepEqual(v1.Interface(), v1.Interface()) {
+		t.Errorf("constructed struct %v not equal to itself", v1.Interface())
+	}
+	v1.FieldByName("X").Set(ValueOf(int(1)))
+	if i1, i2 := v1.Interface(), v2.Interface(); DeepEqual(i1, i2) {
+		t.Errorf("constructed structs %v and %v should not be equal", i1, i2)
+	}
+
+	st = StructOf([]StructField{{Name: "X", Tag: "x", Type: TypeOf([]int(nil))}})
+	v1 = New(st).Elem()
+	shouldPanic(func() { _ = v1.Interface() == v1.Interface() })
+}
+
+func TestStructOfGenericAlg(t *testing.T) {
+	st1 := StructOf([]StructField{
+		{Name: "X", Tag: "x", Type: TypeOf(int64(0))},
+		{Name: "Y", Type: TypeOf(string(""))},
+	})
+	st := StructOf([]StructField{
+		{Name: "S0", Type: st1},
+		{Name: "S1", Type: st1},
+	})
+
+	for _, table := range []struct {
+		rt  Type
+		idx []int
+	}{
+		{
+			rt:  st,
+			idx: []int{0, 1},
+		},
+		{
+			rt:  st1,
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf([0]int{})},
+					{Name: "YY", Type: TypeOf("")},
+				},
+			),
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf([0]int{})},
+					{Name: "YY", Type: TypeOf("")},
+					{Name: "ZZ", Type: TypeOf([2]int{})},
+				},
+			),
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf([1]int{})},
+					{Name: "YY", Type: TypeOf("")},
+				},
+			),
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf([1]int{})},
+					{Name: "YY", Type: TypeOf("")},
+					{Name: "ZZ", Type: TypeOf([1]int{})},
+				},
+			),
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf([2]int{})},
+					{Name: "YY", Type: TypeOf("")},
+					{Name: "ZZ", Type: TypeOf([2]int{})},
+				},
+			),
+			idx: []int{1},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf(int64(0))},
+					{Name: "YY", Type: TypeOf(byte(0))},
+					{Name: "ZZ", Type: TypeOf("")},
+				},
+			),
+			idx: []int{2},
+		},
+		{
+			rt: StructOf(
+				[]StructField{
+					{Name: "XX", Type: TypeOf(int64(0))},
+					{Name: "YY", Type: TypeOf(int64(0))},
+					{Name: "ZZ", Type: TypeOf("")},
+					{Name: "AA", Type: TypeOf([1]int64{})},
+				},
+			),
+			idx: []int{2},
+		},
+	} {
+		v1 := New(table.rt).Elem()
+		v2 := New(table.rt).Elem()
+
+		if !DeepEqual(v1.Interface(), v1.Interface()) {
+			t.Errorf("constructed struct %v not equal to itself", v1.Interface())
+		}
+
+		v1.FieldByIndex(table.idx).Set(ValueOf("abc"))
+		v2.FieldByIndex(table.idx).Set(ValueOf("def"))
+		if i1, i2 := v1.Interface(), v2.Interface(); DeepEqual(i1, i2) {
+			t.Errorf("constructed structs %v and %v should not be equal", i1, i2)
+		}
+
+		abc := "abc"
+		v1.FieldByIndex(table.idx).Set(ValueOf(abc))
+		val := "+" + abc + "-"
+		v2.FieldByIndex(table.idx).Set(ValueOf(val[1:4]))
+		if i1, i2 := v1.Interface(), v2.Interface(); !DeepEqual(i1, i2) {
+			t.Errorf("constructed structs %v and %v should be equal", i1, i2)
+		}
+
+		// Test hash
+		m := MakeMap(MapOf(table.rt, TypeOf(int(0))))
+		m.SetMapIndex(v1, ValueOf(1))
+		if i1, i2 := v1.Interface(), v2.Interface(); !m.MapIndex(v2).IsValid() {
+			t.Errorf("constructed structs %#v and %#v have different hashes", i1, i2)
+		}
+
+		v2.FieldByIndex(table.idx).Set(ValueOf("a" + "b" + "c"))
+		if i1, i2 := v1.Interface(), v2.Interface(); !DeepEqual(i1, i2) {
+			t.Errorf("constructed structs %v and %v should be equal", i1, i2)
+		}
+
+		if i1, i2 := v1.Interface(), v2.Interface(); !m.MapIndex(v2).IsValid() {
+			t.Errorf("constructed structs %v and %v have different hashes", i1, i2)
+		}
+	}
+}
+
+func TestStructOfDirectIface(t *testing.T) {
+	{
+		type T struct{ X [1]*byte }
+		i1 := Zero(TypeOf(T{})).Interface()
+		v1 := ValueOf(&i1).Elem()
+		p1 := v1.InterfaceData()[1]
+
+		i2 := Zero(StructOf([]StructField{
+			{
+				Name: "X",
+				Type: ArrayOf(1, TypeOf((*int8)(nil))),
+			},
+		})).Interface()
+		v2 := ValueOf(&i2).Elem()
+		p2 := v2.InterfaceData()[1]
+
+		if p1 != 0 {
+			t.Errorf("got p1=%v. want=%v", p1, nil)
+		}
+
+		if p2 != 0 {
+			t.Errorf("got p2=%v. want=%v", p2, nil)
+		}
+	}
+	{
+		type T struct{ X [0]*byte }
+		i1 := Zero(TypeOf(T{})).Interface()
+		v1 := ValueOf(&i1).Elem()
+		p1 := v1.InterfaceData()[1]
+
+		i2 := Zero(StructOf([]StructField{
+			{
+				Name: "X",
+				Type: ArrayOf(0, TypeOf((*int8)(nil))),
+			},
+		})).Interface()
+		v2 := ValueOf(&i2).Elem()
+		p2 := v2.InterfaceData()[1]
+
+		if p1 == 0 {
+			t.Errorf("got p1=%v. want=not-%v", p1, nil)
+		}
+
+		if p2 == 0 {
+			t.Errorf("got p2=%v. want=not-%v", p2, nil)
+		}
+	}
+}
+
+type StructI int
+
+func (i StructI) Get() int { return int(i) }
+
+type StructIPtr int
+
+func (i *StructIPtr) Get() int { return int(*i) }
+
+func TestStructOfWithInterface(t *testing.T) {
+	type Iface interface {
+		Get() int
+	}
+	for _, table := range []struct {
+		typ  Type
+		val  Value
+		impl bool
+	}{
+		{
+			typ:  TypeOf(StructI(42)),
+			val:  ValueOf(StructI(42)),
+			impl: true,
+		},
+		{
+			typ: PtrTo(TypeOf(StructI(42))),
+			val: ValueOf(func() interface{} {
+				v := StructI(42)
+				return &v
+			}()),
+			impl: true,
+		},
+		{
+			typ: PtrTo(TypeOf(StructIPtr(42))),
+			val: ValueOf(func() interface{} {
+				v := StructIPtr(42)
+				return &v
+			}()),
+			impl: true,
+		},
+		{
+			typ:  TypeOf(StructIPtr(42)),
+			val:  ValueOf(StructIPtr(42)),
+			impl: false,
+		},
+		//		{
+		//			typ: TypeOf((*Iface)(nil)).Elem(), // FIXME(sbinet)
+		//			val: ValueOf(StructI(42)),
+		//			impl: true,
+		//		},
+	} {
+		rt := StructOf(
+			[]StructField{
+				{
+					Name:    "",
+					PkgPath: "",
+					Type:    table.typ,
+				},
+			},
+		)
+		want := 42
+		rv := New(rt).Elem()
+		rv.Field(0).Set(table.val)
+
+		if _, ok := rv.Interface().(Iface); ok != table.impl {
+			if table.impl {
+				t.Errorf("type=%v fails to implement Iface.\n", table.typ.Name())
+			} else {
+				t.Errorf("type=%v should NOT implement Iface\n", table.typ.Name())
+			}
+		}
+
+		if !table.impl {
+			continue
+		}
+
+		fct := rv.MethodByName("Get")
+		out := fct.Call(nil)
+		if !DeepEqual(out[0].Interface(), want) {
+			t.Errorf("x.Get()=%v. want=%v\n", out[0].Interface(), want)
+		}
+	}
+}
+
 func TestChanOf(t *testing.T) {
 	// check construction and use of type not in binary
 	type T string
