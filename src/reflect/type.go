@@ -17,8 +17,12 @@ package reflect
 
 import (
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -327,6 +331,9 @@ type imethod struct {
 	pkgPath *string // nil for exported Names; otherwise import path
 	typ     *rtype  // .(*FuncType) underneath
 }
+
+// imethods is a slice of imethod, as sorted by the compiler
+type imethods []imethod
 
 // interfaceType represents an interface type.
 type interfaceType struct {
@@ -697,6 +704,19 @@ func (d ChanDir) String() string {
 	}
 	return "ChanDir" + strconv.Itoa(int(d))
 }
+
+func (ms imethods) Less(i, j int) bool {
+	mi := ms[i]
+	mj := ms[j]
+	if *mi.name != *mj.name {
+		return *mi.name < *mj.name
+	}
+	// duplicate names can only occur if pkgPath is not nil
+	return *mi.pkgPath < *mj.pkgPath
+}
+
+func (ms imethods) Swap(i, j int) { ms[i], ms[j] = ms[j], ms[i] }
+func (ms imethods) Len() int      { return len(ms) }
 
 // Method returns the i'th method in the type's method set.
 func (t *interfaceType) Method(i int) (m Method) {
@@ -1160,10 +1180,17 @@ func implements(T, V *rtype) bool {
 		for j := 0; j < len(v.methods); j++ {
 			tm := &t.methods[i]
 			vm := &v.methods[j]
-			if *vm.name == *tm.name && vm.pkgPath == tm.pkgPath && vm.typ == tm.typ {
-				if i++; i >= len(t.methods) {
-					return true
-				}
+			if tm.name != vm.name && *tm.name != *vm.name {
+				continue
+			}
+			if tm.pkgPath != vm.pkgPath && (tm.pkgPath == nil || vm.pkgPath == nil || *tm.pkgPath != *vm.pkgPath) {
+				continue
+			}
+			if tm.typ != vm.typ {
+				continue
+			}
+			if i++; i >= len(t.methods) {
+				return true
 			}
 		}
 		return false
@@ -1177,13 +1204,36 @@ func implements(T, V *rtype) bool {
 	for j := 0; j < len(v.methods); j++ {
 		tm := &t.methods[i]
 		vm := &v.methods[j]
-		if *vm.name == *tm.name && vm.pkgPath == tm.pkgPath && vm.mtyp == tm.typ {
-			if i++; i >= len(t.methods) {
-				return true
-			}
+		if tm.name != vm.name && *tm.name != *vm.name {
+			continue
+		}
+		if tm.pkgPath != vm.pkgPath && (tm.pkgPath == nil || vm.pkgPath == nil || *tm.pkgPath != *vm.pkgPath) {
+			continue
+		}
+		if tm.typ != vm.mtyp {
+			continue
+		}
+		if i++; i >= len(t.methods) {
+			return true
 		}
 	}
 	return false
+}
+
+func isExported(name string) bool {
+	r, _ := utf8.DecodeRuneInString(name)
+	if r == utf8.RuneError {
+		panic("reflect: invalid rune [" + name + "]")
+	}
+	return unicode.IsUpper(r)
+}
+
+func shortPkgName(pkgPath string) string {
+	i := strings.LastIndex(pkgPath, "/")
+	if i == -1 {
+		return pkgPath
+	}
+	return pkgPath[i+1:]
 }
 
 // directlyAssignable reports whether a value x of type V can be directly
@@ -1873,6 +1923,15 @@ func SliceOf(t Type) Type {
 	return cachePut(ckey, &slice.rtype)
 }
 
+func strPtrOrNil(str string) *string {
+	if str == "" {
+		return nil
+	}
+	ret := new(string)
+	*ret = str
+	return ret
+}
+
 // ArrayOf returns the array type with the given count and element type.
 // For example, if t represents int, ArrayOf(5, t) represents [5]int.
 //
@@ -1982,6 +2041,125 @@ func ArrayOf(count int, elem Type) Type {
 	}
 
 	return cachePut(ckey, &array.rtype)
+}
+
+// InterfaceOf returns the interface type containing methods.
+func InterfaceOf(methods []Method) Type {
+
+	type mkey struct {
+		name    string
+		pkgPath string
+	}
+
+	var (
+		hash       = fnv1(0, []byte("iface")...)
+		hashable   = true
+		comparable = true
+
+		ms   = imethods{}
+		repr = []byte("interface {")
+		seen = map[mkey]struct{}{}
+	)
+
+	for i, method := range methods {
+		m := imethod{
+			name:    strPtrOrNil(method.Name),
+			pkgPath: strPtrOrNil(method.PkgPath),
+			typ:     method.Type.common(),
+		}
+
+		switch {
+		case m.typ.Kind() != Func:
+			panic("reflect: non-func method type")
+
+		case m.name == nil:
+			panic("reflect: illegal anonymous method")
+
+		case m.pkgPath == nil && !isExported(*m.name):
+			panic("reflect: unexported method " + *m.name + " missing package path")
+		}
+
+		mk := mkey{name: *m.name}
+		name := ""
+		if m.pkgPath != nil {
+			name = shortPkgName(*m.pkgPath) + "."
+			mk.pkgPath = *m.pkgPath
+			hash = fnv1(hash, []byte(*m.pkgPath)...)
+		}
+		name += *m.name
+		if _, dup := seen[mk]; dup {
+			panic("reflect: duplicate method " + name)
+		}
+		seen[mk] = struct{}{}
+		repr = append(repr, ' ')
+		repr = append(repr, []byte(name)...)
+		hash = fnv1(hash, []byte(*m.name)...)
+
+		mt := m.typ
+		comparable = comparable && (mt.alg.equal != nil)
+		hashable = hashable && (mt.alg.hash != nil)
+
+		// copy the type signature, leaving out the leading 'func'
+		repr = append(repr, []byte((mt.String())[len("func"):])...)
+		hash = fnv1(
+			hash,
+			byte(mt.hash>>24), byte(mt.hash>>16),
+			byte(mt.hash>>8), byte(mt.hash),
+		)
+
+		if i < len(methods)-1 {
+			repr = append(repr, ';')
+		} else {
+			repr = append(repr, ' ')
+		}
+		ms = append(ms, m)
+	}
+	repr = append(repr, '}')
+	str := string(repr)
+	sort.Sort(ms)
+
+	// make the interface type.
+	var iiface interface{} = new(interface {
+		f()
+	})
+	prototype := (*interfaceType)(unsafe.Pointer((*(**ptrType)(unsafe.Pointer(&iiface))).elem))
+	iface := new(interfaceType)
+	*iface = *prototype
+	iface.methods = ms
+
+	// create a key.
+	// there's a chance for hash collision
+	ckey := cacheKey{Interface, nil, nil, uintptr(hash)}
+	if len(ms) > 0 {
+		ckey.t1 = ms[0].typ
+	}
+	if len(ms) > 1 {
+		ckey.t2 = ms[1].typ
+	}
+
+	// Look in the cache.
+	if t := cacheGet(ckey); t != nil {
+		i := *(**interfaceType)(unsafe.Pointer(&t))
+		if len(ms) == len(i.methods) && implements(&i.rtype, &iface.rtype) {
+			return t
+		}
+	}
+
+	// Look in known types.
+	for _, t := range typesByString(str) {
+		i := *(**interfaceType)(unsafe.Pointer(&t))
+		if len(ms) == len(i.methods) && implements(&i.rtype, &iface.rtype) {
+			return cachePut(ckey, t)
+		}
+	}
+
+	iface.string = &str
+	iface.hash = hash
+	iface.uncommonType = nil
+	iface.zero = unsafe.Pointer(&make([]byte, iface.size)[0])
+	iface.ptrToThis = nil
+
+	return cachePut(ckey, &iface.rtype)
 }
 
 // toType converts from a *rtype to a Type that can be returned

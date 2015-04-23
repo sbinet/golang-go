@@ -3388,6 +3388,109 @@ func checkSameType(t *testing.T, x, y interface{}) {
 	}
 }
 
+func TestInterfaceOf(t *testing.T) {
+	// check construction and use of type not in binary
+	type T string
+	it := InterfaceOf([]Method{
+		Method{
+			Type: TypeOf(func() T { return "" }),
+			Name: "Y",
+		},
+		Method{
+			Type: TypeOf(func() T { return "" }),
+			Name: "X",
+		},
+	})
+
+	type I1 interface {
+		X() T
+	}
+
+	type I2 interface {
+		Z() T
+	}
+
+	i1t := TypeOf(new(I1)).Elem()
+	i2t := TypeOf(new(I2)).Elem()
+	if !it.Implements(i1t) {
+		t.Errorf("constructed interface %v does not implement %v", it, i1t)
+	}
+	if it.Implements(i2t) {
+		t.Errorf("constructed interface %v should not implement %v", it, i2t)
+	}
+
+	// check that type already in binary is found
+	emptyConstructed := InterfaceOf(nil)
+	emptyCompiled := TypeOf(new(interface{})).Elem()
+	if emptyConstructed != emptyCompiled {
+		t.Errorf("did not find pre-existing type for %s (vs %s)", emptyConstructed, emptyCompiled)
+	}
+	zConstructed := InterfaceOf([]Method{
+		Method{Name: "Z", Type: TypeOf(func() T { return "" })},
+		Method{Name: "z", PkgPath: "reflect_test", Type: TypeOf(func() T { return "" })},
+	})
+	zCompiled := TypeOf(new(interface {
+		Z() T
+		z() T
+	})).Elem()
+	if zConstructed != zCompiled {
+		t.Errorf("did not find pre-existing type for %s (vs %s)", zConstructed, zCompiled)
+	}
+
+	// check that listing duplicate methods fails
+	shouldPanic(func() {
+		InterfaceOf([]Method{
+			Method{Name: "X", Type: TypeOf(func() {})},
+			Method{Name: "X", Type: TypeOf(func() {})},
+		})
+	})
+	shouldPanic(func() {
+		InterfaceOf([]Method{
+			Method{Name: "x", PkgPath: "pkg", Type: TypeOf(func() {})},
+			Method{Name: "x", PkgPath: "pkg", Type: TypeOf(func() {})},
+		})
+	})
+	shouldPanic(func() {
+		// Missing package path for unexported symbol
+		InterfaceOf([]Method{Method{Name: "x", Type: TypeOf(func() {})}})
+	})
+	shouldPanic(func() {
+		// Missing name
+		InterfaceOf([]Method{Method{Type: TypeOf(func() {})}})
+	})
+	shouldPanic(func() {
+		// Non-func method type
+		InterfaceOf([]Method{Method{Type: TypeOf("")}})
+	})
+}
+
+type InterfaceTestInt int
+
+func (x InterfaceTestInt) Ident() InterfaceTestInt {
+	return x
+}
+
+// This tests that the func type of InterfaceOfX.X is included in .typelink
+// even though it is not refered to by any compiled symbols. It also tests
+// the creation of an itab from a constructed interface.
+func TestInterfaceOfContainingCompiledMethodType(t *testing.T) {
+	ft := FuncOf(nil, []Type{TypeOf(InterfaceTestInt(0))}, false)
+	expected := ValueOf(InterfaceTestInt(0)).MethodByName("Ident").Type()
+	if ft != expected {
+		t.Errorf("constructed func type '%v' is duplicate of compiled type '%v'", ft, expected)
+	}
+	// check construction and use of type not in binary
+	it := InterfaceOf([]Method{
+		Method{
+			Type: ft,
+			Name: "Ident",
+		},
+	})
+	// test Set does not panic
+	i := New(it).Elem()
+	i.Set(ValueOf(InterfaceTestInt(0)))
+}
+
 func TestArrayOf(t *testing.T) {
 	// check construction and use of type not in binary
 	for _, table := range []struct {
