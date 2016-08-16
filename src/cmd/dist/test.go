@@ -1072,4 +1072,5 @@ var cgoPackages = []string{
 	"crypto/x509",
 	"net",
 	"os/user",
+	"plugin",
 }

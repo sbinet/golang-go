@@ -261,6 +261,7 @@ var pkgDeps = map[string][]string{
 	"mime/quotedprintable":     {"L4"},
 	"net/internal/socktest":    {"L4", "OS", "syscall"},
 	"net/url":                  {"L4"},
+	"plugin":                   {"C", "errors", "fmt", "reflect", "syscall", "unsafe"},
 	"text/scanner":             {"L4", "OS"},
 	"text/template/parse":      {"L4"},
 
