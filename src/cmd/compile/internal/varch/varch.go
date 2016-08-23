@@ -1,0 +1,4 @@
+package varch
+
+func Main() {
+}

@@ -39,6 +39,7 @@ var bootstrapDirs = []string{
 	"compile/internal/s390x",
 	"compile/internal/ssa",
 	"compile/internal/syntax",
+	"compile/internal/varch",
 	"compile/internal/x86",
 	"internal/bio",
 	"internal/gcprog",
@@ -49,6 +50,7 @@ var bootstrapDirs = []string{
 	"internal/obj/mips",
 	"internal/obj/ppc64",
 	"internal/obj/s390x",
+	"internal/obj/varch",
 	"internal/obj/x86",
 	"internal/sys",
 	"link",
@@ -59,6 +61,7 @@ var bootstrapDirs = []string{
 	"link/internal/mips64",
 	"link/internal/ppc64",
 	"link/internal/s390x",
+	"link/internal/varch",
 	"link/internal/x86",
 }
 
